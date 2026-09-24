@@ -4,10 +4,10 @@ An iPhone-Fold-style lid animation for the MacBook: the picture stays fixed in s
 
 ## Installation
 1. Open `dist/Unfold.dmg` and drag **Unfold** onto **Applications**.
-2. Launch Unfold from Applications. It shows up in the Dock and in the menu bar, and registers itself as a login item on first launch.
+2. Launch Unfold from Applications. It lives in the menu bar (no Dock icon) and registers itself as a login item on first launch.
 
 ## Usage
-The settings window opens from the Dock icon or via **Settings…** in the menu bar menu.
+The settings window opens via **Settings…** in the menu bar menu, or by launching Unfold again while it's running.
 
 - **Image plane β**: angle of the virtual screen; from here on everything is sharp
 - **Black below**: below this angle the picture slips into black
