@@ -1,0 +1,6 @@
+# Build output (DMG is published as a GitHub release instead)
+build/
+dist/
+
+# macOS
+.DS_Store
