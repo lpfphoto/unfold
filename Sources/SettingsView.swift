@@ -50,8 +50,10 @@ struct SettingsView: View {
 
     private var gaugeCard: some View {
         Card {
-            LidGauge(phi: Double(engine.angle), beta: settings.clearAbove, blackBelow: settings.blackBelow,
-                     edgeMask: settings.perspective || settings.topFade > 0 ? engine.geometry(phi: Double(engine.angle)).edgeMask(columns: 120) : nil)
+            LidGauge(phi: Double(engine.angle), beta: Double(engine.planeAngle),
+                     blackBelow: settings.blackBelow * min(Double(engine.planeAngle) / max(settings.clearAbove, 1), 1),
+                     edgeMask: settings.perspective || settings.topFade > 0
+                        ? engine.geometry(phi: Double(engine.angle), beta: Double(engine.planeAngle)).edgeMask(columns: 120) : nil)
                 .frame(height: 170)
                 .opacity(engine.sensorAvailable || engine.previewing ? 1 : 0.35)
             Text("The picture stays fixed in space at β = \(Int(settings.clearAbove))°. Each row blurs in proportion to its distance from the image plane (s · sin α). Below \(Int(settings.blackBelow))° it slips into black.")
@@ -87,6 +89,10 @@ struct SettingsView: View {
     private var behaviourCard: some View {
         Card(title: "Behavior") {
             ToggleRow(title: "Also when closing", subtitle: "The effect plays in reverse, live, as you close the lid.", isOn: $settings.blurWhileClosing)
+            ToggleRow(title: "Follow the resting lid", subtitle: "The virtual screen settles wherever the lid rests, so moving it from any angle starts the effect right away.", isOn: $settings.releaseWhenStill)
+            SliderRow(title: "After", value: $settings.releaseDelay, range: 0.5...5, format: { String(format: "%.1f s", $0) })
+                .disabled(!settings.releaseWhenStill)
+                .opacity(settings.releaseWhenStill ? 1 : 0.45)
             ToggleRow(title: "Show on lock screen", subtitle: "Needed if your Mac locks immediately after waking.", isOn: $settings.showOnLockScreen)
             ToggleRow(title: "Launch at login", subtitle: nil, isOn: Binding(get: { login.isEnabled }, set: { login.set($0) }))
             if let error = login.error {

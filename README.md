@@ -15,6 +15,7 @@ The settings window opens from the Dock icon or via **Settings…** in the menu 
 - **Top edge fade**: soft fade to black at the physical top edge; disappears at β
 - **Perspective**: eye distance and height for the black edges, width of the soft edge
 - **Also when closing**: the effect also plays in reverse, live, while closing the lid
+- **Follow the resting lid** (after 0.5 s by default): wherever the lid rests, below or above β, the virtual screen swings over to it in 0.7 s on a cubic Bézier ease (0.4, 0, 0.2, 1): the black wedges retreat into the corners and the blur recedes, so moving the lid from any angle starts the effect right away. Opening further, the lid pushes the virtual screen along, always slightly behind it so nothing flickers; sleep resets it to β, so opening from closed plays the configured animation all the way up to β (while opening from closed, stillness below 10° is ignored and a pause only counts as rest after 1.5 s; 2° hysteresis, so sensor jitter doesn't count as movement)
 - **Show on lock screen**: draws the effect above the lock screen after waking
 - **Play Preview**: plays the animation without moving the lid
 - **Log**: opens `~/Library/Logs/Unfold.log` (sleep/wake events and the angle trace after waking)
