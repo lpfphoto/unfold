@@ -40,23 +40,16 @@ struct SettingsView: View {
         .padding(.top, 34)   // clears the transparent title bar
         .padding(.bottom, 22)
         .fixedSize()
-        .onChange(of: settings.clearAbove) { _, v in
-            if settings.blackBelow > v - 10 { settings.blackBelow = max(0, v - 10) }
-        }
-        .onChange(of: settings.blackBelow) { _, v in
-            if settings.clearAbove < v + 10 { settings.clearAbove = v + 10 }
-        }
     }
 
     private var gaugeCard: some View {
         Card {
             LidGauge(phi: Double(engine.angle), beta: Double(engine.planeAngle),
-                     blackBelow: settings.blackBelow * min(Double(engine.planeAngle) / max(settings.clearAbove, 1), 1),
                      edgeMask: settings.perspective || settings.topFade > 0
                         ? engine.geometry(phi: Double(engine.angle), beta: Double(engine.planeAngle)).edgeMask(columns: 120) : nil)
                 .frame(height: 170)
                 .opacity(engine.sensorAvailable || engine.previewing ? 1 : 0.35)
-            Text("The picture stays fixed in space at β = \(Int(settings.clearAbove))°. Each row blurs in proportion to its distance from the image plane (s · sin α). Below \(Int(settings.blackBelow))° it slips into black.")
+            Text("The picture stays fixed in space at β = \(Int(settings.clearAbove))°. Each row blurs in proportion to its distance from the image plane (s · sin α).")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -65,8 +58,7 @@ struct SettingsView: View {
 
     private var effectCard: some View {
         Card(title: "Effect") {
-            SliderRow(title: "Image plane β (sharp from)", value: $settings.clearAbove, range: 45...135, format: { "\(Int($0))°" })
-            SliderRow(title: "Black below", value: $settings.blackBelow, range: 0...60, format: { "\(Int($0))°" })
+            SliderRow(title: "Image plane β (sharp from)", value: $settings.clearAbove, range: 45...135, step: 1, format: { "\(Int($0.rounded()))°" })
             SliderRow(title: "Blur at top", value: $settings.blurRadius, range: 10...150, format: { "\(Int($0)) pt" })
             SliderRow(title: "Dimming at top", value: $settings.dim, range: 0...0.9, format: { "\(Int(($0 * 100).rounded())) %" })
             SliderRow(title: "Top edge fade", value: $settings.topFade, range: 0...10, format: { String(format: "%.1f cm", $0) })
@@ -77,6 +69,7 @@ struct SettingsView: View {
         Card(title: "Perspective") {
             ToggleRow(title: "Virtual screen", subtitle: "Everything outside the fixed virtual screen turns black.", isOn: $settings.perspective)
             Group {
+                ToggleRow(title: "Corner-pin the picture", subtitle: "Stretches the whole desktop into the virtual screen instead of just masking it.", isOn: $settings.cornerPin)
                 SliderRow(title: "Eye distance to hinge", value: $settings.eyeDistance, range: 30...90, format: { "\(Int($0)) cm" })
                 SliderRow(title: "Eye height above keyboard", value: $settings.eyeHeight, range: 5...60, format: { "\(Int($0)) cm" })
                 SliderRow(title: "Soft edge", value: $settings.feather, range: 0...8, format: { String(format: "%.1f cm", $0) })
@@ -146,6 +139,7 @@ private struct SliderRow: View {
     let title: String
     @Binding var value: Double
     let range: ClosedRange<Double>
+    var step: Double? = nil
     let format: (Double) -> String
 
     var body: some View {
@@ -155,7 +149,11 @@ private struct SliderRow: View {
                 Spacer()
                 Text(format(value)).monospacedDigit().foregroundStyle(.secondary)
             }
-            Slider(value: $value, in: range)
+            if let step {
+                Slider(value: $value, in: range, step: step)
+            } else {
+                Slider(value: $value, in: range)
+            }
         }
     }
 }
@@ -182,20 +180,14 @@ private struct ToggleRow: View {
 }
 
 /// Live version of the hand sketch: side view (image plane, lid, horizontal distances) and front view
-/// (per-row blur, red = heavy … green = none, fading to black near closed).
+/// (per-row blur, red = heavy … green = none).
 private struct LidGauge: View {
     let phi: Double
     let beta: Double
-    let blackBelow: Double
     let edgeMask: CGImage?
 
     private var alpha: Double { beta - phi }
     private var distance: Double { alpha > 0 ? sin(min(alpha, 180) * .pi / 180) : 0 }
-    private var black: Double {
-        guard blackBelow > 0, phi < blackBelow else { return 0 }
-        let t = max(phi, 0) / blackBelow
-        return 1 - t * t * (3 - 2 * t)
-    }
 
     var body: some View {
         HStack(spacing: 18) {
@@ -274,7 +266,6 @@ private struct LidGauge: View {
                 if let edgeMask {
                     ctx.draw(Image(decorative: edgeMask, scale: 1), in: CGRect(origin: .zero, size: size))
                 }
-                ctx.fill(Path(CGRect(origin: .zero, size: size)), with: .color(.black.opacity(black)))
             }
             .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
             .padding(4)
