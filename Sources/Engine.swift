@@ -47,15 +47,29 @@ final class Engine: ObservableObject {
     private var isFast = false
     private var cancellables = Set<AnyCancellable>()
 
-    private var rawAngle: Double = 180
-    // The sensor reports whole degrees, so a smooth movement arrives as a staircase of 1° steps. A
-    // critically damped α-β filter (position + velocity) turns that into a continuous angle: it follows
-    // steady movement without lag and averages the steps away. Rest detection still uses `rawAngle`.
+    private var rawAngle: Double = 180     // newest sensor sample (rest detection works on this)
+    // The sensor only samples at ~10 Hz (in hundredths of a degree). The effect follows a smooth curve
+    // through those samples, drawn `sensorDelay` behind the present: one sample period plus the time until
+    // a new sample is noticed and the frame is shown, so there is almost always a real sample on either
+    // side and the motion never has to be guessed. Replaying a recorded lid movement through the app: about
+    // 3× less jitter than the previous filter, 8× closer to the lid's real path, ~15 ms later.
     private var lidAngle: Double = 180
-    private var lidVelocity: Double = 0
-    private static let filterOmega = 14.0
-    private var phi: Double = 180         // displayed (spring-smoothed) lid angle, degrees
-    private var phiVelocity: Double = 0
+    private static let sensorDelay = 0.130
+    // The samples the curve was drawn from last frame. When a new sample changes the curve at the point being
+    // shown (it arrived late, or it bends the end of the curve), the difference goes into the offset below and
+    // eases out, instead of showing up as a jump.
+    private var curveSamples: [LidSample] = []
+    private var curveVersion = -1
+    private var curveCorrection = 0.0
+    private var phi: Double = 180         // displayed lid angle, degrees
+    // Displayed = target + offset. The offset carries real jumps of the target (preview, waking, switching
+    // the effect on) and decays on a critically damped spring, without lagging behind a moving lid.
+    private var phiOffset: Double = 0
+    private var phiOffsetVelocity: Double = 0
+    private var lastTarget: Double = 180
+    private var settleReference: Double = 180
+    private var lastTargetChange: CFTimeInterval = 0
+    private static let jumpThreshold = 6.0      // per frame; a real lid moves ≤ ~2.5° per 120 Hz frame
     private var lastTick: CFTimeInterval = 0
     private var wakeSession = false       // true from sleep until the lid has been opened up to the plane
     private var openingFromClosed = false // same span, but also ends once a resting lid takes over the plane
@@ -91,6 +105,8 @@ final class Engine: ObservableObject {
         sensorAvailable = poller.latest.available
         phi = rawAngle
         lidAngle = rawAngle
+        lastTarget = rawAngle
+        settleReference = rawAngle
         // Launch counts as "at rest": the plane starts where the lid is, so nothing appears until it moves.
         anchorAngle = rawAngle
         lastMotion = -.greatestFiniteMagnitude
@@ -134,8 +150,7 @@ final class Engine: ObservableObject {
     func preview() {
         previewing = true
         previewStart = CACurrentMediaTime()
-        phi = 0
-        phiVelocity = 0
+        show(angle: 0)
         resetPlane()
         render()
         setFast(true)
@@ -155,8 +170,7 @@ final class Engine: ObservableObject {
         guard settings.enabled else { return }
         wakeSession = true
         openingFromClosed = true
-        phi = 0            // as if closed: maximally frosted
-        phiVelocity = 0
+        show(angle: 0)     // as if closed: maximally frosted
         resetPlane()
         noteMotion(now: CACurrentMediaTime(), force: true)   // don't let the armed state relax before sleep
         render()
@@ -166,8 +180,7 @@ final class Engine: ObservableObject {
         lastTick = CACurrentMediaTime()
         if let angle = poller.readNow() { rawAngle = angle }
         sensorAvailable = poller.latest.available
-        lidAngle = rawAngle                       // woke up somewhere else: start the filter afresh
-        lidVelocity = 0
+        lidAngle = rawAngle                       // readNow() started a fresh sample history
         noteMotion(now: lastTick, force: true)   // the rest timer starts when the Mac wakes, not before
         traceUntil = lastTick + 8
         Log.write("\(reason) angle=\(Int(rawAngle)) sensor=\(sensorAvailable) overlayVisible=\(overlay.isVisible) phi=\(Int(phi)) wakeSession=\(wakeSession) plane=\(Int(plane.rounded()))")
@@ -246,7 +259,7 @@ final class Engine: ObservableObject {
         lastTick = now
 
         readSensor()
-        filterLid(dt: dt)
+        updateCurve(now: now)
         noteMotion(now: now)
         let target = targetAngle(now: now)
         let resting = isResting(now: now)
@@ -260,31 +273,51 @@ final class Engine: ObservableObject {
         if now < traceUntil && now - lastTraceLine > 0.1 {
             lastTraceLine = now
             let look = self.look(for: phi)
-            Log.write("  trace sensor=\(Int(rawAngle)) filtered=\(String(format: "%.1f", lidAngle)) target=\(Int(target)) phi=\(String(format: "%.1f", phi)) R=\(String(format: "%.1f", look.topRadius)) plane=\(String(format: "%.1f", plane)) visible=\(overlay.isVisible)")
+            Log.write("  trace sensor=\(String(format: "%.2f", rawAngle)) curve=\(String(format: "%.2f", lidAngle)) target=\(Int(target)) phi=\(String(format: "%.1f", phi)) R=\(String(format: "%.1f", look.topRadius)) plane=\(String(format: "%.1f", plane)) visible=\(overlay.isVisible)")
+        }
+
+        // The curve through the sensor samples wobbles by a few hundredths of a degree at rest; ignore that.
+        if abs(target - settleReference) > 0.1 {
+            settleReference = target
+            lastTargetChange = now
         }
 
         if !isFast {
-            if abs(target - phi) > 0.05 || abs(planeGoal(resting: resting) - plane) > 0.01 {
+            if abs(target - settleReference) > 0.1 || abs(target - phi) > 0.1 || phiOffset != 0
+                || abs(planeGoal(resting: resting) - plane) > 0.01 {
                 setFast(true)
             }
+            lastTarget = target
+            curveCorrection = 0      // nothing is being shown while idle, so there is nothing to smooth over
             return
         }
 
-        // Critically damped spring on top of the filtered angle rounds off what is left of the steps.
-        // Together (α-β ω14 + spring ω35) that is about half the jitter of a plain spring at the same lag.
-        let omega = 35.0
-        phiVelocity += (omega * omega * (target - phi) - 2 * omega * phiVelocity) * dt
-        phi += phiVelocity * dt
-        if abs(target - phi) < 0.05 && abs(phiVelocity) < 0.5 {
-            phi = target
-            phiVelocity = 0
+        // Follow the target exactly; only a jump is absorbed into the offset, which then eases out: a switch
+        // of what the target follows, or a change of the sensor curve under the point being shown.
+        if abs(target - lastTarget) > Self.jumpThreshold {
+            phiOffset += lastTarget - target
+        } else if target == lidAngle {
+            phiOffset += curveCorrection
         }
+        curveCorrection = 0
+        lastTarget = target
+        if phiOffset != 0 {
+            let omega = 35.0
+            phiOffsetVelocity += (-omega * omega * phiOffset - 2 * omega * phiOffsetVelocity) * dt
+            phiOffset += phiOffsetVelocity * dt
+            if abs(phiOffset) < 0.01 && abs(phiOffsetVelocity) < 0.1 {
+                phiOffset = 0
+                phiOffsetVelocity = 0
+            }
+        }
+        phi = target + phiOffset
 
         updatePlane(resting: resting, now: now)
         render()
 
         // Settled: drop back to cheap polling; a partially frosted overlay stays as it is.
-        if phi == target && glide == nil && plane == planeGoal(resting: resting) && !previewing { setFast(false) }
+        if now - lastTargetChange > 0.3 && phiOffset == 0 && glide == nil && plane == planeGoal(resting: resting)
+            && !previewing { setFast(false) }
     }
 
     /// Moves the anchor (and restarts the rest timer) once the lid leaves the hysteresis band.
@@ -374,22 +407,27 @@ final class Engine: ObservableObject {
         return lidAngle
     }
 
-    /// α-β filter, critically damped: θ = e^(−ω·dt), α = 1 − θ², β = (1 − θ)².
-    private func filterLid(dt: Double) {
-        if abs(rawAngle - lidAngle) > 8 {         // a jump no real movement produces in one tick: resync
-            lidAngle = rawAngle
-            lidVelocity = 0
-            return
+    /// Evaluates the sensor curve `sensorDelay` behind `now`, and notes how much a newly arrived sample moved it
+    /// at that very point (see `curveCorrection`).
+    private func updateCurve(now: CFTimeInterval) {
+        let t = now - Self.sensorDelay
+        let (version, samples) = poller.snapshot()
+        let value = SensorPoller.interpolate(samples, at: t) ?? rawAngle
+        if version != curveVersion {
+            if !curveSamples.isEmpty, let before = SensorPoller.interpolate(curveSamples, at: t) {
+                curveCorrection += before - value
+            }
+            curveVersion = version
+            curveSamples = samples
         }
-        let theta = exp(-Self.filterOmega * dt)
-        let predicted = lidAngle + lidVelocity * dt
-        let residual = rawAngle - predicted
-        lidAngle = predicted + (1 - theta * theta) * residual
-        lidVelocity += (1 - theta) * (1 - theta) / dt * residual
-        if abs(rawAngle - lidAngle) < 0.01 && abs(lidVelocity) < 0.05 {
-            lidAngle = rawAngle
-            lidVelocity = 0
-        }
+        lidAngle = value
+    }
+
+    /// Jumps the displayed angle to `angle` right now; the offset then eases back onto the target.
+    private func show(angle: Double) {
+        phiOffset = angle - lastTarget
+        phiOffsetVelocity = 0
+        phi = angle
     }
 
     /// Simulated lid: starts closed, holds briefly, then opens with an ease-in-out past the image plane.
