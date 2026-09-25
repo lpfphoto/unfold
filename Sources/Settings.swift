@@ -16,8 +16,6 @@ final class Settings: ObservableObject {
     @Published var releaseDelay: Double { didSet { defaults.set(releaseDelay, forKey: "releaseDelay") } }
     /// Draw the effect above the lock screen that appears when the Mac wakes.
     @Published var showOnLockScreen: Bool { didSet { defaults.set(showOnLockScreen, forKey: "showOnLockScreen") } }
-    /// Angle (degrees) below which the whole picture fades to black; fully black at 0°.
-    @Published var blackBelow: Double { didSet { defaults.set(blackBelow, forKey: "blackBelow") } }
     /// β: angle (degrees) of the virtual image plane. Once the lid reaches it, the screen is completely sharp.
     @Published var clearAbove: Double { didSet { defaults.set(clearAbove, forKey: "clearAbove") } }
     /// Blur radius at the top edge when the lid is 90° away from the image plane, in points.
@@ -27,6 +25,8 @@ final class Settings: ObservableObject {
 
     /// Black out everything outside the virtual screen as seen from the eye position.
     @Published var perspective: Bool { didSet { defaults.set(perspective, forKey: "perspective") } }
+    /// Warp the picture into the virtual screen (corner pin, fit) instead of only masking it.
+    @Published var cornerPin: Bool { didSet { defaults.set(cornerPin, forKey: "cornerPin") } }
     /// Horizontal distance eye ↔ hinge, cm.
     @Published var eyeDistance: Double { didSet { defaults.set(eyeDistance, forKey: "eyeDistance") } }
     /// Eye height above the keyboard, cm.
@@ -43,11 +43,11 @@ final class Settings: ObservableObject {
             "showOnLockScreen": true,
             "releaseWhenStill": true,
             "releaseDelay": 0.5,
-            "blackBelow": 20.0,
             "clearAbove": 90.0,
             "blurRadius": 70.0,
             "dim": 0.35,
             "perspective": true,
+            "cornerPin": true,
             "eyeDistance": 55.0,
             "eyeHeight": 25.0,
             "feather": 3.0,
@@ -58,11 +58,11 @@ final class Settings: ObservableObject {
         showOnLockScreen = defaults.bool(forKey: "showOnLockScreen")
         releaseWhenStill = defaults.bool(forKey: "releaseWhenStill")
         releaseDelay = defaults.double(forKey: "releaseDelay")
-        blackBelow = defaults.double(forKey: "blackBelow")
         clearAbove = defaults.double(forKey: "clearAbove")
         blurRadius = defaults.double(forKey: "blurRadius")
         dim = defaults.double(forKey: "dim")
         perspective = defaults.bool(forKey: "perspective")
+        cornerPin = defaults.bool(forKey: "cornerPin")
         eyeDistance = defaults.double(forKey: "eyeDistance")
         eyeHeight = defaults.double(forKey: "eyeHeight")
         feather = defaults.double(forKey: "feather")

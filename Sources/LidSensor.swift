@@ -1,5 +1,6 @@
 import Foundation
 import IOKit.hid
+import QuartzCore
 
 /// Reads the MacBook hinge angle from the "lid angle" HID sensor
 /// (Apple vendor 0x05AC, product 0x8104, sensor usage page 0x20 / orientation usage 0x8A).
@@ -35,11 +36,12 @@ final class LidSensor {
     /// Hinge angle in degrees (0 = closed), or nil if the sensor could not be read.
     func read() -> Double? {
         guard let d = device else { return nil }
-        var buffer = [UInt8](repeating: 0, count: 8)
-        var length = CFIndex(buffer.count)
-        guard IOHIDDeviceGetReport(d, kIOHIDReportTypeFeature, 1, &buffer, &length) == kIOReturnSuccess,
-              length >= 3 else { return nil }
-        return Double(UInt16(buffer[1]) | UInt16(buffer[2]) << 8)
+        return withUnsafeTemporaryAllocation(of: UInt8.self, capacity: 8) { buffer -> Double? in
+            var length = CFIndex(buffer.count)
+            guard IOHIDDeviceGetReport(d, kIOHIDReportTypeFeature, 1, buffer.baseAddress!, &length) == kIOReturnSuccess,
+                  length >= 3 else { return nil }
+            return Double(UInt16(buffer[1]) | UInt16(buffer[2]) << 8)
+        }
     }
 
     func close() {
@@ -47,5 +49,79 @@ final class LidSensor {
         if let m = manager { IOHIDManagerClose(m, IOOptionBits(kIOHIDOptionsTypeNone)) }
         device = nil
         manager = nil
+    }
+}
+
+/// Polls the sensor on its own thread. The HID call blocks for ~0.6 ms (mostly waiting on the hardware),
+/// which would otherwise eat into every animation frame on the main thread; here it can take its time and
+/// each frame simply picks up the newest reading.
+final class SensorPoller: @unchecked Sendable {
+    private let sensor = LidSensor()
+    private let sensorLock = NSLock()          // serialises all IOHID calls (poll thread + `readNow`)
+    private let stateLock = NSLock()
+    private let wake = DispatchSemaphore(value: 0)
+    private var angle: Double?
+    private var available = false
+    private var interval = 1.0 / 12
+
+    /// Opens the sensor, takes a first reading synchronously and starts polling. Returns that reading.
+    func start() -> Double? {
+        let first = readNow()
+        let thread = Thread { [unowned self] in self.run() }
+        thread.name = "Unfold.LidSensor"
+        thread.qualityOfService = .userInteractive
+        thread.start()
+        return first
+    }
+
+    /// Newest reading (nil until the first success) and whether the sensor currently answers.
+    var latest: (angle: Double?, available: Bool) {
+        stateLock.withLock { (angle, available) }
+    }
+
+    /// 120 Hz while animating, 12 Hz otherwise. Switching to fast polls right away.
+    func setFast(_ fast: Bool) {
+        let new = fast ? 1.0 / 120 : 1.0 / 12
+        let changed = stateLock.withLock { () -> Bool in
+            defer { interval = new }
+            return interval != new
+        }
+        if changed && fast { wake.signal() }
+    }
+
+    /// A fresh reading right now (e.g. after waking), reopening the device if it stopped answering.
+    @discardableResult
+    func readNow() -> Double? {
+        let (value, open) = sensorLock.withLock { () -> (Double?, Bool) in
+            if sensor.isOpen, let v = sensor.read() { return (v, true) }
+            let v = sensor.open() ? sensor.read() : nil
+            return (v, sensor.isOpen)
+        }
+        store(value, open: open)
+        return value
+    }
+
+    private func run() {
+        var failures = 0
+        while true {
+            let started = CACurrentMediaTime()
+            let (value, open) = sensorLock.withLock { () -> (Double?, Bool) in
+                if let v = sensor.read() { return (v, true) }
+                failures += 1
+                // Keep retrying cheaply; reopen now and then (the device can vanish across sleep).
+                let v = failures % 60 == 0 && sensor.open() ? sensor.read() : nil
+                return (v, sensor.isOpen)
+            }
+            if value != nil { failures = 0 }
+            store(value, open: open)
+            let wait = stateLock.withLock { interval } - (CACurrentMediaTime() - started)
+            if wait > 0 { _ = wake.wait(timeout: .now() + wait) }
+        }
+    }
+
+    private func store(_ value: Double?, open: Bool) {
+        stateLock.withLock {
+            if let value { angle = value; available = true } else if !open { available = false }
+        }
     }
 }

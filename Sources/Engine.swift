@@ -1,5 +1,6 @@
 import AppKit
 import Combine
+import CoreVideo
 import QuartzCore
 
 /// Couples the hinge angle to the overlay, following the "image fixed in space" model:
@@ -12,8 +13,7 @@ import QuartzCore
 ///         └───────── base (X)
 ///
 /// Each row's blur and darkening are proportional to that distance: sharp at the hinge, strongest at the
-/// top edge, and zero everywhere once the lid reaches the plane (φ ≥ β). Below `blackBelow` the whole
-/// picture fades to black. Nothing ever scales.
+/// top edge, and zero everywhere once the lid reaches the plane (φ ≥ β).
 ///
 /// On top, `ViewGeometry` blacks out everything the eye would see *outside* the virtual screen, since the
 /// tilted physical lid appears wider at the top than the fixed virtual screen behind it.
@@ -26,8 +26,8 @@ import QuartzCore
 /// and nothing flickers). Sleep resets the plane to β, so opening from closed is exactly the configured
 /// animation.
 ///
-/// The overlay is put up (fully closed, i.e. black) *before* the Mac sleeps, so the first frame after
-/// the lid opens already shows the effect.
+/// The overlay is put up (as if fully closed) *before* the Mac sleeps, so the first frame after the lid
+/// opens already shows the effect.
 @MainActor
 final class Engine: ObservableObject {
     static let shared = Engine()
@@ -39,14 +39,21 @@ final class Engine: ObservableObject {
     @Published private(set) var planeAngle: Int = 90
 
     let settings = Settings.shared
-    private let sensor = LidSensor()
+    private let poller = SensorPoller()
     private let overlay = Overlay()
     private var timer: Timer?
+    private var displayLink: CVDisplayLink?
+    private let frames = FrameGate()
     private var isFast = false
-    private var readFailures = 0
     private var cancellables = Set<AnyCancellable>()
 
     private var rawAngle: Double = 180
+    // The sensor reports whole degrees, so a smooth movement arrives as a staircase of 1° steps. A
+    // critically damped α-β filter (position + velocity) turns that into a continuous angle: it follows
+    // steady movement without lag and averages the steps away. Rest detection still uses `rawAngle`.
+    private var lidAngle: Double = 180
+    private var lidVelocity: Double = 0
+    private static let filterOmega = 14.0
     private var phi: Double = 180         // displayed (spring-smoothed) lid angle, degrees
     private var phiVelocity: Double = 0
     private var lastTick: CFTimeInterval = 0
@@ -77,12 +84,13 @@ final class Engine: ObservableObject {
     private static let previewDuration = 3.2
     private static let openAngle = 180.0
     private let displaySize = ViewGeometry.builtInDisplaySize
-    private var maskCache: (key: [Double], image: CGImage?)?
+    private var screenPoints = Overlay.builtInScreen?.frame.size ?? CGSize(width: 1728, height: 1117)
 
     func start() {
-        sensorAvailable = sensor.open()
-        readSensor()
+        if let first = poller.start() { rawAngle = first }
+        sensorAvailable = poller.latest.available
         phi = rawAngle
+        lidAngle = rawAngle
         // Launch counts as "at rest": the plane starts where the lid is, so nothing appears until it moves.
         anchorAngle = rawAngle
         lastMotion = -.greatestFiniteMagnitude
@@ -110,7 +118,7 @@ final class Engine: ObservableObject {
         NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.screensChanged() }
         }
-        Log.write("start sensor=\(sensorAvailable) angle=\(Int(rawAngle)) enabled=\(settings.enabled) lockScreen=\(settings.showOnLockScreen) β=\(Int(settings.clearAbove))° black<\(Int(settings.blackBelow))° R=\(Int(settings.blurRadius)) dim=\(settings.dim) perspective=\(settings.perspective) eye=\(Int(settings.eyeDistance))/\(Int(settings.eyeHeight))cm display=\(displaySize)")
+        Log.write("start sensor=\(sensorAvailable) angle=\(Int(rawAngle)) enabled=\(settings.enabled) lockScreen=\(settings.showOnLockScreen) β=\(Int(settings.clearAbove))° R=\(Int(settings.blurRadius)) dim=\(settings.dim) perspective=\(settings.perspective) eye=\(Int(settings.eyeDistance))/\(Int(settings.eyeHeight))cm display=\(displaySize)")
 
         settings.$showOnLockScreen.dropFirst().sink { [weak self] _ in self?.overlay.tearDown() }.store(in: &cancellables)
         // Any setting change: re-evaluate on the next tick (and redraw a settled overlay).
@@ -135,8 +143,7 @@ final class Engine: ObservableObject {
 
     /// Debug aid (`--hold 35`): freezes the effect at a fixed lid angle.
     func hold(angle: Double) {
-        timer?.invalidate()
-        timer = nil
+        stopLoop()
         phi = angle
         render()
     }
@@ -148,7 +155,7 @@ final class Engine: ObservableObject {
         guard settings.enabled else { return }
         wakeSession = true
         openingFromClosed = true
-        phi = 0            // as if closed: black, maximally frosted
+        phi = 0            // as if closed: maximally frosted
         phiVelocity = 0
         resetPlane()
         noteMotion(now: CACurrentMediaTime(), force: true)   // don't let the armed state relax before sleep
@@ -157,17 +164,20 @@ final class Engine: ObservableObject {
 
     private func didWake(_ reason: String) {
         lastTick = CACurrentMediaTime()
-        if !sensor.isOpen || sensor.read() == nil { sensorAvailable = sensor.open() }
-        readSensor()
+        if let angle = poller.readNow() { rawAngle = angle }
+        sensorAvailable = poller.latest.available
+        lidAngle = rawAngle                       // woke up somewhere else: start the filter afresh
+        lidVelocity = 0
         noteMotion(now: lastTick, force: true)   // the rest timer starts when the Mac wakes, not before
         traceUntil = lastTick + 8
         Log.write("\(reason) angle=\(Int(rawAngle)) sensor=\(sensorAvailable) overlayVisible=\(overlay.isVisible) phi=\(Int(phi)) wakeSession=\(wakeSession) plane=\(Int(plane.rounded()))")
-        setFast(true)
+        setFast(true, restart: true)             // the display link belongs to a display that just woke up
     }
 
     private func screensChanged() {
-        guard overlay.isVisible else { return }
-        overlay.show(onLockScreen: settings.showOnLockScreen)  // re-fits the frame to the built-in screen
+        screenPoints = Overlay.builtInScreen?.frame.size ?? screenPoints
+        overlay.refit()
+        if isFast { setFast(true, restart: true) }   // follow the built-in display's refresh again
     }
 
     private func settingsChanged() {
@@ -177,25 +187,66 @@ final class Engine: ObservableObject {
 
     // MARK: - Loop
 
-    private func setFast(_ fast: Bool) {
-        if timer != nil && fast == isFast { return }
-        timer?.invalidate()
+    private func setFast(_ fast: Bool, restart: Bool = false) {
+        if !restart, timer != nil || displayLink != nil, fast == isFast { return }
+        stopLoop()
         isFast = fast
+        poller.setFast(fast)
         lastTick = CACurrentMediaTime()
+        // While animating, run in step with the built-in display and compute every frame for the moment it
+        // will actually be shown, so the motion advances by exactly one refresh per frame (a free-running timer
+        // drifts against the refresh and now and then doubles or skips a frame). CVDisplayLink, bound to that
+        // display: NSScreen/NSView display links follow the main display, which may be a 60 Hz external one
+        // while the lid's panel runs at 120 Hz.
+        if fast, let link = makeDisplayLink() {
+            displayLink = link
+            CVDisplayLinkStart(link)
+            return
+        }
         let t = Timer(timeInterval: fast ? Self.fastInterval : Self.idleInterval, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.tick() }
+            MainActor.assumeIsolated { self?.tick(now: CACurrentMediaTime()) }
         }
         t.tolerance = fast ? 0.001 : 0.02
         RunLoop.main.add(t, forMode: .common)
         timer = t
     }
 
-    private func tick() {
-        let now = CACurrentMediaTime()
+    private func stopLoop() {
+        timer?.invalidate()
+        timer = nil
+        if let link = displayLink { CVDisplayLinkStop(link) }
+        displayLink = nil
+        frames.invalidate()
+    }
+
+    private func makeDisplayLink() -> CVDisplayLink? {
+        guard let screen = Overlay.builtInScreen,
+              let id = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID else { return nil }
+        var link: CVDisplayLink?
+        guard CVDisplayLinkCreateWithCGDisplay(id, &link) == kCVReturnSuccess, let link else { return nil }
+        let gate = frames
+        let generation = gate.begin()
+        CVDisplayLinkSetOutputHandler(link) { _, _, outputTime, _, _ in
+            // Display-link thread: hand the frame's presentation time to the main thread, at most one pending.
+            if gate.post(FrameGate.seconds(hostTime: outputTime.pointee.hostTime), generation: generation) {
+                DispatchQueue.main.async {
+                    MainActor.assumeIsolated {
+                        guard let time = gate.take(generation: generation) else { return }
+                        Engine.shared.tick(now: time)
+                    }
+                }
+            }
+            return kCVReturnSuccess
+        }
+        return link
+    }
+
+    fileprivate func tick(now: CFTimeInterval) {
         let dt = min(max(now - lastTick, 1.0 / 480), 1.0 / 20)
         lastTick = now
 
         readSensor()
+        filterLid(dt: dt)
         noteMotion(now: now)
         let target = targetAngle(now: now)
         let resting = isResting(now: now)
@@ -209,7 +260,7 @@ final class Engine: ObservableObject {
         if now < traceUntil && now - lastTraceLine > 0.1 {
             lastTraceLine = now
             let look = self.look(for: phi)
-            Log.write("  trace sensor=\(Int(rawAngle)) target=\(Int(target)) phi=\(String(format: "%.1f", phi)) R=\(String(format: "%.1f", look.topRadius)) black=\(String(format: "%.2f", look.black)) plane=\(String(format: "%.1f", plane)) visible=\(overlay.isVisible)")
+            Log.write("  trace sensor=\(Int(rawAngle)) filtered=\(String(format: "%.1f", lidAngle)) target=\(Int(target)) phi=\(String(format: "%.1f", phi)) R=\(String(format: "%.1f", look.topRadius)) plane=\(String(format: "%.1f", plane)) visible=\(overlay.isVisible)")
         }
 
         if !isFast {
@@ -219,8 +270,9 @@ final class Engine: ObservableObject {
             return
         }
 
-        // Critically damped spring on the angle: smooths the 1°-resolution sensor, never overshoots.
-        let omega = 18.0
+        // Critically damped spring on top of the filtered angle rounds off what is left of the steps.
+        // Together (α-β ω14 + spring ω35) that is about half the jitter of a plain spring at the same lag.
+        let omega = 35.0
         phiVelocity += (omega * omega * (target - phi) - 2 * omega * phiVelocity) * dt
         phi += phiVelocity * dt
         if abs(target - phi) < 0.05 && abs(phiVelocity) < 0.5 {
@@ -319,7 +371,25 @@ final class Engine: ObservableObject {
         }
         if rawAngle >= settings.clearAbove { wakeSession = false; openingFromClosed = false }
         guard settings.enabled, wakeSession || settings.blurWhileClosing else { return Self.openAngle }
-        return rawAngle
+        return lidAngle
+    }
+
+    /// α-β filter, critically damped: θ = e^(−ω·dt), α = 1 − θ², β = (1 − θ)².
+    private func filterLid(dt: Double) {
+        if abs(rawAngle - lidAngle) > 8 {         // a jump no real movement produces in one tick: resync
+            lidAngle = rawAngle
+            lidVelocity = 0
+            return
+        }
+        let theta = exp(-Self.filterOmega * dt)
+        let predicted = lidAngle + lidVelocity * dt
+        let residual = rawAngle - predicted
+        lidAngle = predicted + (1 - theta * theta) * residual
+        lidVelocity += (1 - theta) * (1 - theta) / dt * residual
+        if abs(rawAngle - lidAngle) < 0.01 && abs(lidVelocity) < 0.05 {
+            lidAngle = rawAngle
+            lidVelocity = 0
+        }
     }
 
     /// Simulated lid: starts closed, holds briefly, then opens with an ease-in-out past the image plane.
@@ -338,32 +408,24 @@ final class Engine: ObservableObject {
         let alpha = beta - phi
         guard alpha > 0 else { return .clear }
         let distance = sin(min(alpha, 180) * .pi / 180)   // top-edge distance to the plane, in lid heights
-        // "Black below" moves with a re-anchored plane, so a lid resting low doesn't stay black.
-        let blackBelow = settings.blackBelow * min(beta / max(settings.clearAbove, 1), 1)
-        var black = 0.0
-        if blackBelow > 0 && phi < blackBelow {
-            let t = max(phi, 0) / blackBelow
-            black = 1 - t * t * (3 - 2 * t)
-        }
         return Overlay.Look(topRadius: settings.blurRadius * distance, topDim: settings.dim * distance,
-                            black: black, edgeMask: edgeMask(for: phi))
+                            masks: masks(for: phi))
     }
 
     func geometry(phi: Double, beta: Double? = nil) -> ViewGeometry {
         ViewGeometry(phi: phi, beta: beta ?? plane, width: displaySize.width, height: displaySize.height,
                      eyeDistance: settings.eyeDistance, eyeHeight: settings.eyeHeight, feather: settings.feather,
-                     topFade: settings.topFade, perspective: settings.perspective)
+                     topFade: settings.topFade, perspective: settings.perspective, cornerPin: settings.cornerPin)
     }
 
-    /// Recomputed only when the angle moved by more than 0.02° or a setting changed.
-    private func edgeMask(for phi: Double) -> CGImage? {
+    /// The overlay redraws the masks only when the key changes: the angle moved by more than 0.02° or a
+    /// setting changed.
+    private func masks(for phi: Double) -> Overlay.Masks? {
         guard settings.perspective || settings.topFade > 0 else { return nil }
+        let size = screenPoints
         let key = [(phi * 50).rounded(), (plane * 50).rounded(), settings.eyeDistance, settings.eyeHeight, settings.feather,
-                   settings.topFade, settings.perspective ? 1 : 0]
-        if let cache = maskCache, cache.key == key { return cache.image }
-        let image = geometry(phi: phi).edgeMask()
-        maskCache = (key, image)
-        return image
+                   settings.topFade, settings.perspective ? 1 : 0, settings.cornerPin ? 1 : 0, size.width, size.height]
+        return Overlay.Masks(geometry: geometry(phi: phi), size: size, key: key)
     }
 
     private func render() {
@@ -376,15 +438,11 @@ final class Engine: ObservableObject {
         }
     }
 
+    /// Picks up the newest reading from the poll thread (never blocks on the hardware).
     private func readSensor() {
-        if let a = sensor.read() {
-            rawAngle = a
-            readFailures = 0
-            if !sensorAvailable { sensorAvailable = true }
-        } else {
-            readFailures += 1
-            if readFailures % 60 == 0 { sensorAvailable = sensor.open() }
-        }
+        let latest = poller.latest
+        if let angle = latest.angle { rawAngle = angle }
+        if latest.available != sensorAvailable { sensorAvailable = latest.available }
     }
 
     private func publishAngle(_ a: Double) {
@@ -428,4 +486,43 @@ struct CubicBezier {
         }
         return sample(t, y1, y2)
     }
+}
+
+
+/// Hands display-link frames from the CVDisplayLink thread to the main thread: keeps only the newest
+/// presentation time, never queues more than one pending frame, and drops frames of a stopped link.
+private final class FrameGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var generation = 0
+    private var pending: CFTimeInterval?
+
+    func begin() -> Int { lock.withLock { generation += 1; pending = nil; return generation } }
+    func invalidate() { lock.withLock { generation += 1; pending = nil } }
+
+    /// Returns true if the main thread needs to be woken (nothing pending yet).
+    func post(_ time: CFTimeInterval, generation g: Int) -> Bool {
+        lock.withLock {
+            guard g == generation else { return false }
+            let wake = pending == nil
+            pending = time
+            return wake
+        }
+    }
+
+    func take(generation g: Int) -> CFTimeInterval? {
+        lock.withLock {
+            guard g == generation else { return nil }
+            defer { pending = nil }
+            return pending
+        }
+    }
+
+    private static let secondsPerHostTick: Double = {
+        var info = mach_timebase_info_data_t()
+        mach_timebase_info(&info)
+        return Double(info.numer) / Double(info.denom) / 1_000_000_000
+    }()
+
+    /// Host time (mach ticks) → the CACurrentMediaTime() time base.
+    static func seconds(hostTime: UInt64) -> CFTimeInterval { Double(hostTime) * secondsPerHostTick }
 }
